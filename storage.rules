@@ -1,0 +1,12 @@
+rules_version = '2';
+
+// Firebase Storage security rules
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Allow all users to read and write to all files
+    // This is suitable for development and demo purposes
+    match /{allPaths=**} {
+      allow read, write: if true;
+    }
+  }
+}
