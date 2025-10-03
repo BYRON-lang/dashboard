@@ -1,10 +1,24 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { saveWebsite, getWebsites, uploadVideo, deleteWebsite, getStorageUsage } from '../api/websites';
 import type { WebsiteData } from '../api/websites';
 
-type Tab = 'data' | 'websites' | 'designs';
+// Dynamic FFmpeg import to avoid SSR issues
+const loadFFmpeg = async () => {
+  const FFmpeg = (await import('@ffmpeg/ffmpeg')).default;
+  const { fetchFile } = await import('@ffmpeg/util');
+  
+  const ffmpeg = FFmpeg.createFFmpeg({ 
+    log: true,
+    corePath: 'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js',
+    wasmPath: 'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.wasm'
+  });
+  
+  return { ffmpeg, fetchFile };
+};
+
+type Tab = 'data' | 'websites';
 
 export function Welcome() {
   const [activeTab, setActiveTab] = useState<Tab>('websites');
@@ -25,14 +39,43 @@ export function Welcome() {
 
   // Video upload state
   const [videoFile, setVideoFile] = useState<File | null>(null);
+  const [processedVideoFile, setProcessedVideoFile] = useState<File | null>(null);
   const [isUploadingVideo, setIsUploadingVideo] = useState(false);
-
-  // Delete website state
+  const [isProcessingVideo, setIsProcessingVideo] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const ffmpegRef = useRef<any>(null);
+  const [isFFmpegLoaded, setIsFFmpegLoaded] = useState(false);
   const [isDeleting, setIsDeleting] = useState<string | null>(null);
-
-  // Storage usage state
-  const [storageUsage, setStorageUsage] = useState<{ fileCount: number; totalSize: number; folders: { [key: string]: { count: number; size: number } } } | null>(null);
+  const [storageUsage, setStorageUsage] = useState<{
+    fileCount: number;
+    totalSize: number;
+    folders: { [key: string]: { count: number; size: number } };
+  } | null>(null);
   const [isLoadingStorage, setIsLoadingStorage] = useState(false);
+
+  // Initialize FFmpeg
+  useEffect(() => {
+    const initFFmpeg = async () => {
+      if (typeof window === 'undefined') return;
+      try {
+        const { ffmpeg, fetchFile } = await loadFFmpeg();
+        
+        // Load FFmpeg
+        if (!ffmpeg.isLoaded()) {
+          console.log('Loading FFmpeg...');
+          await ffmpeg.load();
+          console.log('FFmpeg loaded successfully');
+        }
+        
+        ffmpegRef.current = ffmpeg;
+        setIsFFmpegLoaded(true);
+      } catch (err) {
+        console.error('Failed to load FFmpeg:', err);
+        setSubmitMessage('Warning: Video conversion to WebM is not available. Using original video format.');
+      }
+    };
+    initFFmpeg();
+  }, []);
 
   // Load websites on component mount
   useEffect(() => {
@@ -75,28 +118,98 @@ export function Welcome() {
     }));
   };
 
-  const handleVideoFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const compressAndConvertToWebM = async (file: File): Promise<Blob> => {
+    if (!ffmpegRef.current) throw new Error('FFmpeg not initialized');
+    const ffmpeg = ffmpegRef.current;
+
+    try {
+      console.log('Starting video conversion...');
+      const inputName = 'input.mp4';
+      const outputName = 'output.webm';
+
+      // Write the file to FFmpeg's virtual file system
+      console.log('Writing file to FFmpeg FS...');
+      const { fetchFile } = await loadFFmpeg();
+      await ffmpeg.FS('writeFile', inputName, await fetchFile(file));
+
+      // Set up progress callback
+      ffmpeg.setProgress(({ ratio }: { ratio: number }) => {
+        const percent = Math.round(ratio * 100);
+        setProgress(percent);
+        console.log(`Conversion progress: ${percent}%`);
+      });
+
+      console.log('Starting FFmpeg conversion...');
+      // Run FFmpeg command
+      await ffmpeg.run(
+        '-i', inputName,
+        '-c:v', 'libvpx-vp9',
+        '-b:v', '1M',
+        '-crf', '30',
+        '-preset', 'fast',
+        '-c:a', 'libopus',
+        '-b:a', '64k',
+        '-deadline', 'realtime',
+        '-cpu-used', '4',
+        outputName
+      );
+
+      console.log('FFmpeg conversion complete, reading output...');
+      const data = ffmpeg.FS('readFile', outputName);
+      
+      // Clean up
+      ffmpeg.FS('unlink', inputName);
+      ffmpeg.FS('unlink', outputName);
+
+      console.log(`Conversion successful, output size: ${data.length} bytes`);
+      return new Blob([data.buffer], { type: 'video/webm' });
+    } catch (error) {
+      console.error('FFmpeg error:', error);
+      throw new Error('Failed to convert video: ' + (error instanceof Error ? error.message : String(error)));
+    }
+  };
+
+  const handleVideoFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
-      console.log('Video file selected:', file.name, 'Size:', file.size);
+    if (!file) return;
 
-      // Validate file type
-      if (!file.type.startsWith('video/')) {
-        console.error('Invalid file type:', file.type);
-        setSubmitMessage('Please select a valid video file');
-        return;
+    const validTypes = ['video/mp4', 'video/webm', 'video/quicktime', 'video/x-msvideo', 'video/3gpp', 'video/x-ms-wmv'];
+    if (!validTypes.includes(file.type)) {
+      setSubmitMessage('Invalid video type.');
+      return;
+    }
+
+    if (file.size > 100 * 1024 * 1024) {
+      setSubmitMessage('Video exceeds 100MB.');
+      return;
+    }
+
+    setVideoFile(file);
+    setIsProcessingVideo(true);
+    setSubmitMessage('Processing video...');
+
+    try {
+      if (isFFmpegLoaded && ffmpegRef.current) {
+        const processedBlob = await compressAndConvertToWebM(file);
+        const processedFile = new File(
+          [processedBlob],
+          file.name.replace(/\.[^/.]+$/, '') + '.webm',
+          { type: 'video/webm' }
+        );
+        setProcessedVideoFile(processedFile);
+        setSubmitMessage(`Video processed to WebM (${(processedBlob.size / 1024 / 1024).toFixed(2)} MB)`);
+      } else {
+        // If FFmpeg isn't available, we'll use the original file but show a warning
+        setProcessedVideoFile(file);
+        setSubmitMessage(`Using original video (${(file.size / 1024 / 1024).toFixed(2)} MB) - WebM conversion not available`);
       }
-
-      // Validate file size (100MB limit)
-      if (file.size > 100 * 1024 * 1024) {
-        console.error('File too large:', file.size);
-        setSubmitMessage('Video file must be smaller than 100MB');
-        return;
-      }
-
-      console.log('Video file validated successfully');
-      setVideoFile(file);
-      setSubmitMessage(null);
+    } catch (error) {
+      console.error('Error processing video:', error);
+      setSubmitMessage('Error processing video. Please try again.');
+      setVideoFile(null);
+    } finally {
+      setIsProcessingVideo(false);
+      setProgress(0);
     }
   };
 
@@ -130,24 +243,23 @@ export function Welcome() {
     setSubmitMessage(null);
 
     try {
-      console.log('Starting website submission...');
-
-      // Check if Firebase is configured
-      if (!import.meta.env.VITE_FIREBASE_API_KEY || !import.meta.env.VITE_FIREBASE_PROJECT_ID) {
-        setSubmitMessage('Firebase configuration is missing. Please check your .env file with your Firebase project settings.');
-        return;
-      }
-
       let videoUrl: string | undefined;
-
-      // Upload video if one is selected
-      if (videoFile) {
+      if (processedVideoFile || videoFile) {
         setIsUploadingVideo(true);
         try {
-          videoUrl = await uploadVideo(videoFile);
+          // Use the processed WebM file if available, otherwise fall back to the original
+          const fileToUpload = processedVideoFile || videoFile;
+          if (fileToUpload) {
+            videoUrl = await uploadVideo(fileToUpload);
+            console.log('Video uploaded successfully:', {
+              url: videoUrl,
+              type: fileToUpload.type,
+              size: fileToUpload.size
+            });
+          }
         } catch (error) {
-          setSubmitMessage('Failed to upload video. Please try again.');
-          return;
+          console.error('Error uploading video:', error);
+          throw new Error('Failed to upload video');
         } finally {
           setIsUploadingVideo(false);
         }
@@ -156,7 +268,7 @@ export function Welcome() {
       const websiteData = {
         name: formData.name,
         url: formData.url,
-        categories: formData.categories.split(',').map(cat => cat.trim()).filter(cat => cat.length > 0),
+        categories: formData.categories.split(',').map(c => c.trim()),
         socialLinks: {
           ...(formData.twitter && { twitter: `https://twitter.com/${formData.twitter}` }),
           ...(formData.instagram && { instagram: `https://instagram.com/${formData.instagram}` }),
@@ -164,10 +276,11 @@ export function Welcome() {
         builtWith: formData.builtWith,
         ...(formData.otherTechnologies && { otherTechnologies: formData.otherTechnologies }),
         ...(videoUrl && { videoUrl }),
+        // uploadedAt will be added by the saveWebsite function
       };
 
       await saveWebsite(websiteData);
-      setSubmitMessage('Website saved successfully!');
+
       setFormData({
         name: '',
         url: '',
@@ -178,12 +291,11 @@ export function Welcome() {
         otherTechnologies: '',
       });
       setVideoFile(null);
-
-      // Reset file input
+      setProcessedVideoFile(null);
       const fileInput = document.getElementById('video-upload') as HTMLInputElement;
       if (fileInput) fileInput.value = '';
 
-      // Reload websites
+      setSubmitMessage('Website saved successfully!');
       await loadWebsites();
     } catch (error) {
       console.error('Error saving website:', error);
@@ -196,7 +308,7 @@ export function Welcome() {
   return (
     <div className="h-screen flex flex-col bg-white">
       <header className="w-full h-[45px] border-b border-gray-200 bg-white flex items-center justify-between px-5 flex-shrink-0 sticky top-0 z-10">
-        <span className="text-xl font-semibold text-gray-800">Gridrr</span>
+        <img src="https://gridrr.com/logo.png" alt="Gridrr Logo" className="h-8" />
         <nav className="flex items-center space-x-6">
           <button 
             onClick={() => setActiveTab('data')} 
@@ -209,12 +321,6 @@ export function Welcome() {
             className={`${activeTab === 'websites' ? 'text-blue-600' : 'text-gray-600 hover:text-gray-900'} text-sm font-medium`}
           >
             Websites
-          </button>
-          <button 
-            onClick={() => setActiveTab('designs')} 
-            className={`${activeTab === 'designs' ? 'text-blue-600' : 'text-gray-600 hover:text-gray-900'} text-sm font-medium`}
-          >
-            Designs
           </button>
         </nav>
       </header>
@@ -231,7 +337,7 @@ export function Welcome() {
                   </svg>
                 </div>
                 <h3 className="text-lg font-medium text-gray-900 mb-1">Upload your website</h3>
-                <p className="text-sm text-gray-500 mb-4">Drag and drop your video here, or click to browse</p>
+                <p className="text-sm text-gray-500 mb-4">Drag and drop your video here, or click to browse (will be converted to WebM)</p>
 
                 {/* Video Upload Status */}
                 {videoFile && (
@@ -266,7 +372,15 @@ export function Welcome() {
                     Select video
                   </label>
                 </div>
-                <p className="mt-2 text-xs text-gray-500">MP4, WebM, or MOV up to 100MB</p>
+                {isProcessingVideo && (
+                  <div className="mt-2 w-full bg-gray-200 rounded-full h-2.5">
+                    <div 
+                      className="bg-blue-600 h-2.5 rounded-full" 
+                      style={{ width: `${progress}%` }}
+                    ></div>
+                  </div>
+                )}
+                <p className="mt-2 text-xs text-gray-500">MP4, WebM, or MOV up to 100MB (will be converted to WebM)</p>
               </div>
             </div>
             
@@ -633,6 +747,7 @@ export function Welcome() {
             </div>
           </div>
         )}
+
 
       </main>
     </div>

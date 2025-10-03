@@ -25,16 +25,26 @@ export const uploadVideo = async (file: File): Promise<string> => {
       type: file.type
     });
 
+    // Generate a unique video ID
     const videoId = crypto.randomUUID();
-    const videoRef = ref(storage, `videos/${videoId}_${file.name}`);
+    
+    // Create a clean filename by replacing spaces and special characters
+    const cleanFileName = file.name.replace(/[^\w\d.-]/g, '_');
+    
+    // Create the storage reference with the new format: videos/{videoId}_{filename}
+    const storagePath = `videos/${videoId}_${cleanFileName}`;
+    const videoRef = ref(storage, storagePath);
 
     console.log('Uploading to Firebase Storage path:', videoRef.fullPath);
 
+    // Upload the file to Firebase Storage
     await uploadBytes(videoRef, file);
-    const downloadURL = await getDownloadURL(videoRef);
-
-    console.log('Video uploaded successfully:', downloadURL);
-    return downloadURL;
+    
+    // Instead of using the Firebase download URL, construct the CDN URL directly
+    const cdnUrl = `https://cdn.gridrr.com/videos/${videoId}_${cleanFileName}`;
+    
+    console.log('Video uploaded successfully. CDN URL:', cdnUrl);
+    return cdnUrl;
   } catch (error) {
     console.error('Error uploading video to Firebase Storage:', error);
     throw new Error('Failed to upload video');
